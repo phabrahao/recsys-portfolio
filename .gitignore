@@ -1,0 +1,16 @@
+# environment
+.venv/
+
+# data (MovieLens license prohibits redistribution; also just large)
+data/raw/
+data/processed/
+*.parquet
+*.duckdb
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
