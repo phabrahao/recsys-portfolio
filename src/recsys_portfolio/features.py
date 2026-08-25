@@ -18,6 +18,7 @@ test_leakage.py for the regression tests that enforce this.
 import duckdb
 
 DEFAULT_COLD_START_THRESHOLD = 10
+DEFAULT_GENRE_FATIGUE_WINDOW_DAYS = 30
 
 
 def add_rolling_rating_count(
@@ -63,17 +64,87 @@ def add_cold_start_flag(
     )
 
 
+def add_genre_fatigue_score(
+    rel: duckdb.DuckDBPyRelation,
+    movies_csv_path: str,
+    window_days: int = DEFAULT_GENRE_FATIGUE_WINDOW_DAYS,
+) -> duckdb.DuckDBPyRelation:
+    """
+    Fatigue precursor feature: for each event, how much has this user recently
+    been exposed to the current movie's genre(s), as of that point in time.
+
+    Design decisions (see 01_feature_pipeline/README.md for the full writeup):
+      - Time-based window (last `window_days` days), not count-based (last N
+        ratings) -- fatigue is about recency in real time, not interaction
+        count, so a user who rates 5 movies in one sitting shouldn't look
+        identical to one who spreads them across a year.
+      - Multi-genre movies (e.g. "Action|Sci-Fi") are handled by averaging
+        the prior-exposure count across all of the movie's genres, not
+        taking the max (would overstate fatigue from the single most-repeated
+        genre) or using only the first-listed genre (throws away signal from
+        the rest). Average is the middle ground.
+      - Uses a RANGE window frame (not ROWS, unlike the other features in
+        this module) because the window boundary is defined by elapsed time,
+        not a fixed number of preceding rows. EXCLUDE CURRENT ROW keeps the
+        same leakage-safety contract as the rest of this file: a row's score
+        never includes itself.
+
+    rel must already contain user_id, movie_id, event_ts columns (i.e. this
+    is meant to be chained onto add_rolling_rating_count's output, or called
+    directly on a bare events relation).
+    """
+    window_seconds = window_days * 86400
+    return rel.query(
+        "rel_input",
+        f"""
+        WITH movie_genres AS (
+            SELECT movieId AS movie_id, UNNEST(string_split(genres, '|')) AS genre
+            FROM read_csv_auto('{movies_csv_path}')
+            WHERE genres != '(no genres listed)'
+        ),
+        exploded AS (
+            SELECT r.user_id, r.movie_id, r.event_ts, mg.genre
+            FROM rel_input r
+            JOIN movie_genres mg USING (movie_id)
+        ),
+        genre_exposure AS (
+            SELECT
+                user_id, movie_id, event_ts, genre,
+                count(*) OVER (
+                    PARTITION BY user_id, genre ORDER BY event_ts
+                    RANGE BETWEEN {window_seconds} PRECEDING AND CURRENT ROW
+                    EXCLUDE CURRENT ROW
+                ) AS genre_prior_count
+            FROM exploded
+        ),
+        genre_agg AS (
+            SELECT user_id, movie_id, event_ts, avg(genre_prior_count) AS genre_fatigue_score
+            FROM genre_exposure
+            GROUP BY user_id, movie_id, event_ts
+        )
+        SELECT rel_input.*, genre_agg.genre_fatigue_score
+        FROM rel_input
+        JOIN genre_agg USING (user_id, movie_id, event_ts)
+        """,
+    )
+
+
 def build_feature_table(
     con: duckdb.DuckDBPyConnection,
     cold_start_threshold: int = DEFAULT_COLD_START_THRESHOLD,
+    genre_fatigue_window_days: int = DEFAULT_GENRE_FATIGUE_WINDOW_DAYS,
+    movies_csv_path: str = "data/raw/ml-32m/movies.csv",
     source_table: str = "events",
 ) -> duckdb.DuckDBPyRelation:
     """
-    Convenience composition of the two functions above -- the full node-1
+    Convenience composition of the functions above -- the full node-1
     feature set as it stands today. Add new add_<feature>() functions above
-    and chain them in here as the pipeline grows (session recency, genre
-    content vectors, etc. -- see 01_feature_pipeline/README.md step 5).
+    and chain them in here as the pipeline grows (session recency next --
+    see 01_feature_pipeline/README.md step 5).
     """
     rel = add_rolling_rating_count(con, source_table=source_table)
     rel = add_cold_start_flag(rel, threshold=cold_start_threshold)
+    rel = add_genre_fatigue_score(
+        rel, movies_csv_path=movies_csv_path, window_days=genre_fatigue_window_days
+    )
     return rel
