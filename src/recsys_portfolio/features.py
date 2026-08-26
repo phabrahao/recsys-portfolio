@@ -19,6 +19,7 @@ import duckdb
 
 DEFAULT_COLD_START_THRESHOLD = 10
 DEFAULT_GENRE_FATIGUE_WINDOW_DAYS = 30
+DEFAULT_SESSION_GAP_SECONDS = 1800  # 30 minutes
 
 
 def add_rolling_rating_count(
@@ -55,11 +56,11 @@ def add_cold_start_flag(
     different value here when node 3 wants to sweep it.
     """
     return rel.query(
-        "feat_input",
+        "cold_start_input",
         f"""
         SELECT *,
             prior_rating_count < {threshold} AS is_cold_start_at_this_point
-        FROM feat_input
+        FROM cold_start_input
         """,
     )
 
@@ -104,7 +105,7 @@ def add_genre_fatigue_score(
     directly on a bare events relation).
     """
     return rel.query(
-        "rel_input",
+        "fatigue_input",
         f"""
         WITH movie_genres AS (
             SELECT movieId AS movie_id, UNNEST(string_split(genres, '|')) AS genre
@@ -114,7 +115,7 @@ def add_genre_fatigue_score(
         exploded AS (
             SELECT r.user_id, r.movie_id, r.event_ts, mg.genre,
                    r.event_ts // 86400 AS day_bucket
-            FROM rel_input r
+            FROM fatigue_input r
             JOIN movie_genres mg USING (movie_id)
         ),
         exploded_days AS (
@@ -142,9 +143,57 @@ def add_genre_fatigue_score(
             FROM exploded_with_count
             GROUP BY user_id, movie_id, event_ts
         )
-        SELECT rel_input.*, COALESCE(genre_agg.genre_fatigue_score, 0.0) AS genre_fatigue_score
-        FROM rel_input
+        SELECT fatigue_input.*, COALESCE(genre_agg.genre_fatigue_score, 0.0) AS genre_fatigue_score
+        FROM fatigue_input
         LEFT JOIN genre_agg USING (user_id, movie_id, event_ts)
+        """,
+    )
+
+
+def add_session_recency(
+    rel: duckdb.DuckDBPyRelation,
+    session_gap_seconds: int = DEFAULT_SESSION_GAP_SECONDS,
+) -> duckdb.DuckDBPyRelation:
+    """
+    For each event, time elapsed since that user's previous event, and
+    whether this event starts a new session (gap exceeds session_gap_seconds,
+    default 30 minutes -- a common recsys convention for session boundaries).
+
+    Design decision worth naming: a user's first-ever event has NO prior
+    event to measure a gap against. That's represented as NULL, not a
+    sentinel value like -1 or a very large number -- "no history" is a
+    genuinely different case from "an unusually long gap," and a downstream
+    model should be able to treat it as missing rather than as an extreme
+    value that would distort a learned weight. is_new_session is TRUE in
+    this case (a brand-new user's first event is trivially a session start).
+
+    Uses LAG (equivalent to ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING), so it
+    keeps the same leakage-safety contract as the rest of this file: a row's
+    value depends only on the single event strictly before it, never itself.
+    Ties in event_ts (common on MovieLens bulk-import-burst days -- see
+    add_genre_fatigue_score's docstring) are broken by movie_id for a
+    deterministic ordering.
+
+    rel must already contain user_id, movie_id, event_ts columns.
+    """
+    return rel.query(
+        "session_input",
+        f"""
+        SELECT
+            *,
+            event_ts - LAG(event_ts, 1) OVER (
+                PARTITION BY user_id ORDER BY event_ts, movie_id
+            ) AS seconds_since_last_event,
+            CASE
+                WHEN LAG(event_ts, 1) OVER (
+                    PARTITION BY user_id ORDER BY event_ts, movie_id
+                ) IS NULL THEN TRUE
+                WHEN event_ts - LAG(event_ts, 1) OVER (
+                    PARTITION BY user_id ORDER BY event_ts, movie_id
+                ) > {session_gap_seconds} THEN TRUE
+                ELSE FALSE
+            END AS is_new_session
+        FROM session_input
         """,
     )
 
@@ -153,18 +202,19 @@ def build_feature_table(
     con: duckdb.DuckDBPyConnection,
     cold_start_threshold: int = DEFAULT_COLD_START_THRESHOLD,
     genre_fatigue_window_days: int = DEFAULT_GENRE_FATIGUE_WINDOW_DAYS,
+    session_gap_seconds: int = DEFAULT_SESSION_GAP_SECONDS,
     movies_csv_path: str = "data/raw/ml-32m/movies.csv",
     source_table: str = "events",
 ) -> duckdb.DuckDBPyRelation:
     """
     Convenience composition of the functions above -- the full node-1
-    feature set as it stands today. Add new add_<feature>() functions above
-    and chain them in here as the pipeline grows (session recency next --
-    see 01_feature_pipeline/README.md step 5).
+    feature set. This closes out node-1's planned feature list (rolling
+    rating count, cold-start flag, genre fatigue, session recency).
     """
     rel = add_rolling_rating_count(con, source_table=source_table)
     rel = add_cold_start_flag(rel, threshold=cold_start_threshold)
     rel = add_genre_fatigue_score(
         rel, movies_csv_path=movies_csv_path, window_days=genre_fatigue_window_days
     )
+    rel = add_session_recency(rel, session_gap_seconds=session_gap_seconds)
     return rel
