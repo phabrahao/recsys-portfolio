@@ -122,9 +122,9 @@ def add_genre_fatigue_score(
             FROM genre_exposure
             GROUP BY user_id, movie_id, event_ts
         )
-        SELECT rel_input.*, genre_agg.genre_fatigue_score
+        SELECT rel_input.*, COALESCE(genre_agg.genre_fatigue_score, 0.0) AS genre_fatigue_score
         FROM rel_input
-        JOIN genre_agg USING (user_id, movie_id, event_ts)
+        LEFT JOIN genre_agg USING (user_id, movie_id, event_ts)
         """,
     )
 

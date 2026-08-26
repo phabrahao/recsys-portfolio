@@ -17,11 +17,13 @@ Run with: uv run pytest 01_feature_pipeline/tests/test_leakage.py -v
 """
 import duckdb
 import pytest
+import csv
 from pathlib import Path
 from recsys_portfolio.event_stream import EventStream, Event
 from recsys_portfolio.features import (
     add_rolling_rating_count,
     add_cold_start_flag,
+    add_genre_fatigue_score,
     build_feature_table,
 )
 
@@ -154,7 +156,105 @@ def test_rolling_count_feature_breaks_when_boundary_is_wrong(stream):
 
 
 # ---------------------------------------------------------------------------
-# 3. Same check, against the real MovieLens-loaded database (not synthetic)
+# 3. Genre fatigue score: time-based window, multi-genre averaging
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def movies_csv(tmp_path):
+    """Small synthetic movies.csv: enough genre variety to hand-verify averaging,
+    plus one '(no genres listed)' movie to catch row-dropping regressions."""
+    path = tmp_path / "movies_test.csv"
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["movieId", "title", "genres"])
+        w.writerow([10, "A", "Action|Comedy"])
+        w.writerow([11, "B", "Action"])
+        w.writerow([12, "C", "Action|Sci-Fi"])
+        w.writerow([13, "D", "Action"])
+        w.writerow([14, "E", "(no genres listed)"])
+    return path
+
+
+@pytest.fixture
+def fatigue_stream(tmp_path):
+    """User 1 rates 3 Action-genre movies within days of each other, then one
+    more 40 days later -- long enough to fall outside a 30-day fatigue window.
+    Also rates a genre-less movie (14), to test that path doesn't drop rows."""
+    db_path = tmp_path / "fatigue_events.duckdb"
+    es = EventStream(db_path)
+    DAY = 86400
+    for movie_id, ts in [(10, 0), (11, 1 * DAY), (12, 2 * DAY), (13, 40 * DAY), (14, 50 * DAY)]:
+        es.append(Event(user_id=1, movie_id=movie_id, event_ts=ts, rating=4.0))
+    yield es
+    es.close()
+
+
+def test_genre_fatigue_score_builds_up_and_resets_outside_window(fatigue_stream, movies_csv):
+    """Hand-verified ground truth:
+    - movie 10 (Action|Comedy) at day 0: no prior events at all -> 0.0
+    - movie 11 (Action) at day 1: 1 prior Action exposure (movie 10) -> 1.0
+    - movie 12 (Action|Sci-Fi) at day 2: prior Action=2 (movies 10,11), prior
+      Sci-Fi=0 -> average = 1.0. This is the multi-genre-averaging behavior:
+      NOT max (would give 2.0), NOT first-genre-only (would give 2.0 or 0.0
+      depending on which genre is "first").
+    - movie 13 (Action) at day 40: the window is 30 days, so events from
+      day 0-2 are all more than 30 days before day 40 -> correctly resets to 0.0
+    - movie 14 ((no genres listed)) at day 50: no genre data at all -> 0.0
+      via LEFT JOIN + COALESCE, and critically must NOT disappear from the
+      result (see test_genre_fatigue_score_does_not_drop_genreless_movies)
+    """
+    rel = add_rolling_rating_count(fatigue_stream.con)
+    result = add_genre_fatigue_score(
+        rel, movies_csv_path=str(movies_csv), window_days=30
+    ).order("event_ts").pl()
+
+    scores = result["genre_fatigue_score"].to_list()
+    assert scores == [0.0, 1.0, 1.0, 0.0, 0.0], (
+        f"genre_fatigue_score didn't match hand-verified expectation: {scores}"
+    )
+
+
+def test_genre_fatigue_score_averages_not_maxes_across_genres(fatigue_stream, movies_csv):
+    """Isolates the averaging behavior specifically: movie 12 is Action|Sci-Fi
+    with prior counts [2, 0] across those two genres. avg=1.0, max would be 2.0.
+    This test exists to catch a regression to max-based aggregation."""
+    rel = add_rolling_rating_count(fatigue_stream.con)
+    result = add_genre_fatigue_score(
+        rel, movies_csv_path=str(movies_csv), window_days=30
+    ).pl()
+
+    movie_12_score = result.filter(result["movie_id"] == 12)["genre_fatigue_score"][0]
+    assert movie_12_score == 1.0, (
+        f"expected average(2, 0)=1.0 for movie 12's two genres, got {movie_12_score} "
+        f"-- if this is 2.0, aggregation regressed to max() instead of avg()"
+    )
+
+
+def test_genre_fatigue_score_does_not_drop_genreless_movies(fatigue_stream, movies_csv):
+    """Regression test for a real bug found in this project: an INNER JOIN
+    against movie_genres silently dropped every event for movies tagged
+    '(no genres listed)', because those movies have zero rows in the
+    exploded genre table. Caught by comparing row count in vs out -- lost
+    55,498 rows (32,000,204 -> 31,944,706) against the real MovieLens data
+    before this test existed. Must be a LEFT JOIN with COALESCE to 0.0."""
+    rel = add_rolling_rating_count(fatigue_stream.con)
+    result = add_genre_fatigue_score(
+        rel, movies_csv_path=str(movies_csv), window_days=30
+    ).pl()
+
+    assert result.height == 5, (
+        f"expected all 5 input events to survive the join, got {result.height} rows "
+        f"-- a genre-less movie is likely being silently dropped"
+    )
+
+    movie_14_score = result.filter(result["movie_id"] == 14)["genre_fatigue_score"][0]
+    assert movie_14_score == 0.0, (
+        f"genre-less movie should default to genre_fatigue_score=0.0, got {movie_14_score}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 4. Same check, against the real MovieLens-loaded database (not synthetic)
 # ---------------------------------------------------------------------------
 
 REAL_DB_PATH = Path("data/processed/events.duckdb")
@@ -194,7 +294,8 @@ def test_real_data_first_rating_has_zero_prior_count():
 
     # goes through the REAL pipeline composition (build_feature_table), not
     # a hand-written query -- this is the same call build_features.py makes
-    result = build_feature_table(con).filter(f"movie_id = {movie_id}").pl()
+    result = build_feature_table(con, movies_csv_path="data/raw/ml-32m/movies.csv") \
+        .filter(f"movie_id = {movie_id}").pl()
 
     assert result["prior_rating_count"].to_list() == [0], (
         f"movie_id={movie_id} has exactly 1 rating total but "
@@ -203,6 +304,22 @@ def test_real_data_first_rating_has_zero_prior_count():
     assert result["is_cold_start_at_this_point"].to_list() == [True], (
         f"movie_id={movie_id}'s only rating should be flagged cold-start "
         f"(0 prior ratings), got {result['is_cold_start_at_this_point'].to_list()}"
+    )
+    assert "genre_fatigue_score" in result.columns, (
+        "build_feature_table did not attach genre_fatigue_score -- "
+        "check movies.csv path and the join in add_genre_fatigue_score"
+    )
+
+    # the row-loss regression check: build_feature_table's output row count
+    # must equal the input event count, no matter which features are chained
+    # in -- any INNER JOIN in a feature function is a bug (should be LEFT JOIN)
+    full_result_count = build_feature_table(
+        con, movies_csv_path="data/raw/ml-32m/movies.csv"
+    ).count("*").fetchone()[0]
+    assert full_result_count == total, (
+        f"build_feature_table dropped rows: {total} events in, "
+        f"{full_result_count} out ({total - full_result_count} lost) -- "
+        f"a feature function is likely using INNER JOIN where it should use LEFT JOIN"
     )
 
     con.close()

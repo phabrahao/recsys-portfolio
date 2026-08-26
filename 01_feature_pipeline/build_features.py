@@ -13,7 +13,10 @@ EVENTS_DB_PATH = Path("data/processed/events.duckdb")
 FEATURES_PARQUET_PATH = Path("data/processed/features.parquet")
 
 
-def main(cold_start_threshold: int = DEFAULT_COLD_START_THRESHOLD) -> None:
+def main(
+    cold_start_threshold: int = DEFAULT_COLD_START_THRESHOLD,
+    genre_fatigue_window_days: int = 30,
+) -> None:
     if not EVENTS_DB_PATH.exists():
         raise FileNotFoundError(
             f"{EVENTS_DB_PATH} not found -- load historical data first, e.g.:\n"
@@ -29,7 +32,12 @@ def main(cold_start_threshold: int = DEFAULT_COLD_START_THRESHOLD) -> None:
     # write connection to the same file (e.g. an EventStream instance).
     con = duckdb.connect(str(EVENTS_DB_PATH), read_only=True)
 
-    rel = build_feature_table(con, cold_start_threshold=cold_start_threshold)
+    rel = build_feature_table(
+        con,
+        cold_start_threshold=cold_start_threshold,
+        genre_fatigue_window_days=genre_fatigue_window_days,
+        movies_csv_path="data/raw/ml-32m/movies.csv",
+    )
 
     # COPY runs the whole window-function query and streams the result
     # straight to Parquet -- avoids materializing all 32M rows into a
@@ -44,10 +52,16 @@ def main(cold_start_threshold: int = DEFAULT_COLD_START_THRESHOLD) -> None:
         SELECT avg(is_cold_start_at_this_point::INT)
         FROM '{FEATURES_PARQUET_PATH.as_posix()}'
     """).fetchone()[0]
+    fatigue_stats = con.sql(f"""
+        SELECT avg(genre_fatigue_score), max(genre_fatigue_score)
+        FROM '{FEATURES_PARQUET_PATH.as_posix()}'
+    """).fetchone()
 
     print(f"wrote {row_count:,} rows to {FEATURES_PARQUET_PATH}")
     print(f"cold_start_threshold={cold_start_threshold} -> "
           f"{cold_start_share:.2%} of events flagged cold-start")
+    print(f"genre_fatigue_window_days={genre_fatigue_window_days} -> "
+          f"mean={fatigue_stats[0]:.3f}, max={fatigue_stats[1]:.1f}")
 
     con.close()
 
