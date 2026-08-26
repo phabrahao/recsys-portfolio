@@ -305,98 +305,107 @@ def test_genre_fatigue_score_does_not_drop_genreless_movies(fatigue_stream, movi
 
 
 # ---------------------------------------------------------------------------
-# 4. Session recency: LAG-based gap, NULL for first-ever event
+# 4. Session recency: day-bucketed session boundary, burst-robust
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def session_stream(tmp_path):
-    """User 1: first event, then +10min (same session), then +2h after that
-    (new session, gap > 30min default threshold). User 2: single event, to
-    check the brand-new-user NULL case independently of user 1's history."""
+    """User 1: a 5-rating burst on day 0 (seconds apart, simulating
+    bulk-import), then a genuine event on day 5, then another event on that
+    SAME day 5 an hour later. User 2: single event, to check the brand-new-
+    user NULL case independently of user 1's history."""
     db_path = tmp_path / "session_events.duckdb"
     es = EventStream(db_path)
-    for uid, mid, ts in [(1, 100, 0), (1, 101, 600), (1, 102, 600 + 7200), (2, 200, 500)]:
-        es.append(Event(user_id=uid, movie_id=mid, event_ts=ts, rating=4.0))
+    for i, mid in enumerate(range(100, 105)):
+        es.append(Event(user_id=1, movie_id=mid, event_ts=i * 3, rating=4.0))  # 3s apart
+    DAY = 86400
+    es.append(Event(user_id=1, movie_id=200, event_ts=5 * DAY, rating=4.0))
+    es.append(Event(user_id=1, movie_id=201, event_ts=5 * DAY + 3600, rating=4.0))
+    es.append(Event(user_id=2, movie_id=300, event_ts=500, rating=3.0))
     yield es
     es.close()
 
 
-def test_session_recency_first_event_is_null_not_sentinel(session_stream):
-    """A user's first-ever event has no prior event to measure a gap
-    against. Must be NULL (missing), not a sentinel like -1 or a large
-    number -- see add_session_recency's docstring for why this distinction
-    matters for a downstream model."""
-    result = add_session_recency(session_stream.con.sql(
-        "SELECT user_id, movie_id, event_ts FROM events"
-    )).pl()
-
-    user1_first = result.filter(
-        (result["user_id"] == 1) & (result["event_ts"] == 0)
-    )
-    assert user1_first["seconds_since_last_event"][0] is None
-    assert user1_first["is_new_session"][0] == True
-
-    user2_only = result.filter(result["user_id"] == 2)
-    assert user2_only["seconds_since_last_event"][0] is None
-    assert user2_only["is_new_session"][0] == True
-
-
-def test_session_recency_gap_and_session_boundary(session_stream):
-    """Hand-verified ground truth for user 1's three events:
-    - event at ts=0: first event -> NULL, new_session=True
-    - event at ts=600 (10 min later): gap=600s, still within 30-min default
-      threshold -> new_session=False
-    - event at ts=7800 (2h after that): gap=7200s, exceeds 1800s threshold
-      -> new_session=True
-    """
-    result = add_session_recency(session_stream.con.sql(
-        "SELECT user_id, movie_id, event_ts FROM events"
-    )).filter("user_id = 1").order("event_ts").pl()
-
-    gaps = result["seconds_since_last_event"].to_list()
-    sessions = result["is_new_session"].to_list()
-
-    assert gaps == [None, 600, 7200], f"unexpected gaps: {gaps}"
-    assert sessions == [True, False, True], f"unexpected session flags: {sessions}"
-
-
-def test_session_recency_respects_custom_gap_threshold(session_stream):
-    """The 10-minute gap (600s) should flip to a new session if the
-    threshold is lowered below it -- proves the threshold parameter is
-    actually wired through, not hardcoded."""
+def test_session_recency_burst_day_has_one_new_session_not_many(session_stream):
+    """Regression test for a real issue found in this project: against the
+    real 32M-row dataset, a threshold-based is_new_session (gap > 30 min)
+    had median seconds_since_last_event=10, p75=34, 83% of gaps under 1
+    minute -- MovieLens bulk-import bursts made the elapsed-time threshold
+    untrustworthy at sub-day resolution. This test asserts the fix: only the
+    FIRST event of a burst day is a new session, regardless of how tight the
+    gaps are between the rest."""
     result = add_session_recency(
-        session_stream.con.sql("SELECT user_id, movie_id, event_ts FROM events"),
-        session_gap_seconds=300,  # 5 minutes -- stricter than the 10-min gap
-    ).filter("user_id = 1").order("event_ts").pl()
+        session_stream.con.sql("SELECT user_id, movie_id, event_ts FROM events")
+    ).filter("user_id = 1 AND event_ts < 300").order("event_ts").pl()
 
     sessions = result["is_new_session"].to_list()
-    assert sessions == [True, True, True], (
-        f"with a 5-minute threshold, the 10-minute gap should now count as a "
-        f"new session too, got {sessions}"
+    assert sessions == [True, False, False, False, False], (
+        f"expected only the first burst event to start a new session, got {sessions} "
+        f"-- if more are True, the day-bucketing fix has regressed toward "
+        f"trusting sub-day gaps again"
     )
+
+
+def test_session_recency_new_calendar_day_starts_new_session(session_stream):
+    """Movie 200, 5 days after the burst, must be a new session regardless
+    of its (huge, but irrelevant) raw seconds_since_last_event -- this is
+    what the day-bucketed logic is FOR."""
+    result = add_session_recency(
+        session_stream.con.sql("SELECT user_id, movie_id, event_ts FROM events")
+    ).filter("movie_id = 200").pl()
+
+    assert result["is_new_session"][0] == True
+    assert result["days_since_last_active_day"][0] == 5
+
+
+def test_session_recency_same_day_stays_one_session_even_with_large_gap(session_stream):
+    """Movie 201 is on the SAME calendar day as movie 200, but an hour
+    later. Even though the raw gap (3600s) is much larger than the OLD
+    30-minute threshold would have allowed, it must NOT start a new session
+    -- day granularity, not elapsed seconds, decides the boundary now."""
+    result = add_session_recency(
+        session_stream.con.sql("SELECT user_id, movie_id, event_ts FROM events")
+    ).filter("movie_id = 201").pl()
+
+    assert result["is_new_session"][0] == False, (
+        "a same-day event was flagged as a new session -- day-bucketing logic broke"
+    )
+    assert result["seconds_since_last_event"][0] == 3600
+
+
+def test_session_recency_first_ever_event_has_null_days_since_active(session_stream):
+    """A user's first-ever active day has no prior active day to measure
+    against -- days_since_last_active_day must be NULL, not a sentinel,
+    same reasoning as the rest of this file's NULL-for-missing-history
+    convention. Checked independently via user 2, who has no history from
+    user 1's burst to interfere with the assertion."""
+    result = add_session_recency(
+        session_stream.con.sql("SELECT user_id, movie_id, event_ts FROM events")
+    ).filter("user_id = 2").pl()
+
+    assert result["days_since_last_active_day"][0] is None
+    assert result["seconds_since_last_event"][0] is None
+    assert result["is_new_session"][0] == True
 
 
 def test_session_recency_never_uses_current_or_future_event(session_stream):
     """Leakage check consistent with the rest of this file: perturbing a
-    LATER event's timestamp must not change an EARLIER event's computed gap.
-    This is the LAG-based equivalent of the ROWS/RANGE frame checks above."""
+    LATER event's timestamp must not change an EARLIER event's computed
+    values. Moves movie 201 far into the future and confirms movie 200's
+    values (and the burst's) are unaffected."""
     con = session_stream.con
     before = add_session_recency(
         con.sql("SELECT user_id, movie_id, event_ts FROM events")
-    ).filter("user_id = 1 AND event_ts = 600").pl()["seconds_since_last_event"][0]
+    ).filter("movie_id = 200").pl()
 
-    # move user 1's LAST event much further into the future -- should have
-    # zero effect on the gap computed for the middle event
-    con.execute("UPDATE events SET event_ts = 999999 WHERE user_id = 1 AND movie_id = 102")
+    con.execute("UPDATE events SET event_ts = 9999999 WHERE movie_id = 201")
 
     after = add_session_recency(
         con.sql("SELECT user_id, movie_id, event_ts FROM events")
-    ).filter("user_id = 1 AND event_ts = 600").pl()["seconds_since_last_event"][0]
+    ).filter("movie_id = 200").pl()
 
-    assert before == after == 600, (
-        f"changing a later event's timestamp changed an earlier event's "
-        f"gap ({before} -> {after}) -- this would be a leakage bug"
-    )
+    assert before["is_new_session"][0] == after["is_new_session"][0] == True
+    assert before["days_since_last_active_day"][0] == after["days_since_last_active_day"][0] == 5
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +466,9 @@ def test_real_data_first_rating_has_zero_prior_count():
     )
     assert "seconds_since_last_event" in result.columns, (
         "build_feature_table did not attach session recency columns"
+    )
+    assert "days_since_last_active_day" in result.columns, (
+        "build_feature_table did not attach the day-bucketed session recency column"
     )
 
     # the row-loss regression check: build_feature_table's output row count

@@ -16,7 +16,6 @@ FEATURES_PARQUET_PATH = Path("data/processed/features.parquet")
 def main(
     cold_start_threshold: int = DEFAULT_COLD_START_THRESHOLD,
     genre_fatigue_window_days: int = 30,
-    session_gap_seconds: int = 1800,
 ) -> None:
     if not EVENTS_DB_PATH.exists():
         raise FileNotFoundError(
@@ -37,7 +36,6 @@ def main(
         con,
         cold_start_threshold=cold_start_threshold,
         genre_fatigue_window_days=genre_fatigue_window_days,
-        session_gap_seconds=session_gap_seconds,
         movies_csv_path="data/raw/ml-32m/movies.csv",
     )
 
@@ -61,7 +59,8 @@ def main(
     session_stats = con.sql(f"""
         SELECT
             avg(is_new_session::INT),
-            median(seconds_since_last_event)
+            median(seconds_since_last_event),
+            median(days_since_last_active_day)
         FROM '{FEATURES_PARQUET_PATH.as_posix()}'
     """).fetchone()
 
@@ -70,9 +69,10 @@ def main(
           f"{cold_start_share:.2%} of events flagged cold-start")
     print(f"genre_fatigue_window_days={genre_fatigue_window_days} -> "
           f"mean={fatigue_stats[0]:.3f}, max={fatigue_stats[1]:.1f}")
-    print(f"session_gap_seconds={session_gap_seconds} -> "
+    print(f"session (day-granularity) -> "
           f"{session_stats[0]:.2%} of events start a new session, "
-          f"median gap (non-null)={session_stats[1]}s")
+          f"median seconds_since_last_event (raw, noisy)={session_stats[1]}s, "
+          f"median days_since_last_active_day={session_stats[2]}")
 
     con.close()
 

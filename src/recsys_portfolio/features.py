@@ -19,7 +19,6 @@ import duckdb
 
 DEFAULT_COLD_START_THRESHOLD = 10
 DEFAULT_GENRE_FATIGUE_WINDOW_DAYS = 30
-DEFAULT_SESSION_GAP_SECONDS = 1800  # 30 minutes
 
 
 def add_rolling_rating_count(
@@ -150,50 +149,80 @@ def add_genre_fatigue_score(
     )
 
 
-def add_session_recency(
-    rel: duckdb.DuckDBPyRelation,
-    session_gap_seconds: int = DEFAULT_SESSION_GAP_SECONDS,
-) -> duckdb.DuckDBPyRelation:
+def add_session_recency(rel: duckdb.DuckDBPyRelation) -> duckdb.DuckDBPyRelation:
     """
-    For each event, time elapsed since that user's previous event, and
-    whether this event starts a new session (gap exceeds session_gap_seconds,
-    default 30 minutes -- a common recsys convention for session boundaries).
+    For each event: raw elapsed time since that user's previous event, and a
+    burst-robust session boundary defined at DAY granularity.
 
-    Design decision worth naming: a user's first-ever event has NO prior
-    event to measure a gap against. That's represented as NULL, not a
-    sentinel value like -1 or a very large number -- "no history" is a
-    genuinely different case from "an unusually long gap," and a downstream
-    model should be able to treat it as missing rather than as an extreme
-    value that would distort a learned weight. is_new_session is TRUE in
-    this case (a brand-new user's first event is trivially a session start).
+    This function's original design used a fixed elapsed-time threshold
+    (e.g. gap > 30 min = new session), matching the earlier version of this
+    function. That was found to be unusable against the real 32M-row data:
+    the distribution of seconds_since_last_event has median=10s, p75=34s,
+    and 83% of all gaps under 1 minute -- MovieLens bulk-import behavior
+    (the same root cause as add_genre_fatigue_score's burst problem) means
+    most CONSECUTIVE rating pairs for a user land seconds apart, regardless
+    of whether the user's real activity was actually continuous. A
+    threshold on that signal can't distinguish "genuinely still browsing"
+    from "this rating was auto-generated 3 seconds after the last one during
+    an import" -- both produce a small gap, and OR-ing the threshold back in
+    doesn't help, since a long gap INSIDE a burst is just as likely to be
+    another import artifact as a real absence.
 
-    Uses LAG (equivalent to ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING), so it
-    keeps the same leakage-safety contract as the rest of this file: a row's
-    value depends only on the single event strictly before it, never itself.
-    Ties in event_ts (common on MovieLens bulk-import-burst days -- see
-    add_genre_fatigue_score's docstring) are broken by movie_id for a
-    deterministic ordering.
+    Design decision: is_new_session is TRUE only for a user's first event on
+    a given calendar day (via ROW_NUMBER), never based on elapsed seconds.
+    days_since_last_active_day is the day-bucketed analog of
+    add_genre_fatigue_score's day-exposure count -- the trustworthy recency
+    signal, NULL for a user's first-ever active day. seconds_since_last_event
+    is kept as a raw, honestly-labeled feature (useful signal a model can
+    learn to discount) but is NOT used to define the session boundary,
+    because the sanity check above shows it can't be trusted at sub-day
+    resolution in this dataset.
 
-    rel must already contain user_id, movie_id, event_ts columns.
+    Note for node 5: this day-granularity default reflects a limitation of
+    MovieLens's historical timestamps, not a general claim that sub-day
+    session detection is impossible -- node 5's live feedback loop will have
+    genuinely real-time timestamps (not bulk-imported), where a
+    seconds/minutes-based session threshold would be trustworthy again. That
+    would be a different function, or a parameter reintroduced once live
+    data justifies it -- not something to fake here against import noise.
+
+    rel must already contain user_id, movie_id, event_ts columns. Ties in
+    event_ts within the same user+day are broken by movie_id for
+    deterministic ordering (same convention as the rest of this file).
     """
     return rel.query(
         "session_input",
-        f"""
+        """
+        WITH day_marked AS (
+            SELECT *,
+                event_ts // 86400 AS day_bucket,
+                event_ts - LAG(event_ts, 1) OVER (
+                    PARTITION BY user_id ORDER BY event_ts, movie_id
+                ) AS seconds_since_last_event
+            FROM session_input
+        ),
+        active_days AS (
+            SELECT DISTINCT user_id, day_bucket FROM day_marked
+        ),
+        day_gaps AS (
+            SELECT user_id, day_bucket,
+                day_bucket - LAG(day_bucket, 1) OVER (
+                    PARTITION BY user_id ORDER BY day_bucket
+                ) AS days_since_last_active_day
+            FROM active_days
+        ),
+        first_event_flag AS (
+            SELECT *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY user_id, day_bucket ORDER BY event_ts, movie_id
+                ) = 1 AS is_new_session
+            FROM day_marked
+        )
         SELECT
-            *,
-            event_ts - LAG(event_ts, 1) OVER (
-                PARTITION BY user_id ORDER BY event_ts, movie_id
-            ) AS seconds_since_last_event,
-            CASE
-                WHEN LAG(event_ts, 1) OVER (
-                    PARTITION BY user_id ORDER BY event_ts, movie_id
-                ) IS NULL THEN TRUE
-                WHEN event_ts - LAG(event_ts, 1) OVER (
-                    PARTITION BY user_id ORDER BY event_ts, movie_id
-                ) > {session_gap_seconds} THEN TRUE
-                ELSE FALSE
-            END AS is_new_session
-        FROM session_input
+            f.* EXCLUDE (day_bucket),
+            g.days_since_last_active_day
+        FROM first_event_flag f
+        JOIN day_gaps g USING (user_id, day_bucket)
         """,
     )
 
@@ -202,7 +231,6 @@ def build_feature_table(
     con: duckdb.DuckDBPyConnection,
     cold_start_threshold: int = DEFAULT_COLD_START_THRESHOLD,
     genre_fatigue_window_days: int = DEFAULT_GENRE_FATIGUE_WINDOW_DAYS,
-    session_gap_seconds: int = DEFAULT_SESSION_GAP_SECONDS,
     movies_csv_path: str = "data/raw/ml-32m/movies.csv",
     source_table: str = "events",
 ) -> duckdb.DuckDBPyRelation:
@@ -216,5 +244,5 @@ def build_feature_table(
     rel = add_genre_fatigue_score(
         rel, movies_csv_path=movies_csv_path, window_days=genre_fatigue_window_days
     )
-    rel = add_session_recency(rel, session_gap_seconds=session_gap_seconds)
+    rel = add_session_recency(rel)
     return rel
