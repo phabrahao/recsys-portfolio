@@ -190,15 +190,14 @@ def fatigue_stream(tmp_path):
 
 
 def test_genre_fatigue_score_builds_up_and_resets_outside_window(fatigue_stream, movies_csv):
-    """Hand-verified ground truth:
-    - movie 10 (Action|Comedy) at day 0: no prior events at all -> 0.0
-    - movie 11 (Action) at day 1: 1 prior Action exposure (movie 10) -> 1.0
-    - movie 12 (Action|Sci-Fi) at day 2: prior Action=2 (movies 10,11), prior
-      Sci-Fi=0 -> average = 1.0. This is the multi-genre-averaging behavior:
-      NOT max (would give 2.0), NOT first-genre-only (would give 2.0 or 0.0
-      depending on which genre is "first").
-    - movie 13 (Action) at day 40: the window is 30 days, so events from
-      day 0-2 are all more than 30 days before day 40 -> correctly resets to 0.0
+    """Hand-verified ground truth (day-bucketed):
+    - movie 10 (Action|Comedy) at day 0: no prior days at all -> 0.0
+    - movie 11 (Action) at day 1: 1 prior day with Action activity (day 0) -> 1.0
+    - movie 12 (Action|Sci-Fi) at day 2: prior Action days=2 (day 0, day 1),
+      prior Sci-Fi days=0 -> average = 1.0. This is the multi-genre-averaging
+      behavior: NOT max (would give 2.0), NOT first-genre-only.
+    - movie 13 (Action) at day 40: the window is 30 days, so activity from
+      day 0-2 is all more than 30 days before day 40 -> correctly resets to 0.0
     - movie 14 ((no genres listed)) at day 50: no genre data at all -> 0.0
       via LEFT JOIN + COALESCE, and critically must NOT disappear from the
       result (see test_genre_fatigue_score_does_not_drop_genreless_movies)
@@ -216,8 +215,8 @@ def test_genre_fatigue_score_builds_up_and_resets_outside_window(fatigue_stream,
 
 def test_genre_fatigue_score_averages_not_maxes_across_genres(fatigue_stream, movies_csv):
     """Isolates the averaging behavior specifically: movie 12 is Action|Sci-Fi
-    with prior counts [2, 0] across those two genres. avg=1.0, max would be 2.0.
-    This test exists to catch a regression to max-based aggregation."""
+    with prior day-counts [2, 0] across those two genres. avg=1.0, max would
+    be 2.0. This test exists to catch a regression to max-based aggregation."""
     rel = add_rolling_rating_count(fatigue_stream.con)
     result = add_genre_fatigue_score(
         rel, movies_csv_path=str(movies_csv), window_days=30
@@ -227,6 +226,57 @@ def test_genre_fatigue_score_averages_not_maxes_across_genres(fatigue_stream, mo
     assert movie_12_score == 1.0, (
         f"expected average(2, 0)=1.0 for movie 12's two genres, got {movie_12_score} "
         f"-- if this is 2.0, aggregation regressed to max() instead of avg()"
+    )
+
+
+def test_genre_fatigue_score_is_robust_to_bulk_import_bursts(tmp_path):
+    """Regression test for a real issue found in this project: against the
+    real 32M-row dataset, a raw-event-count version of this feature had
+    median=19.25, p95=189, max=4156 -- because MovieLens has bulk-import
+    users with thousands of ratings landing on a single calendar day
+    (max observed: 6,456 ratings in one day for one user). That's an import
+    artifact, not fatigue. This test builds the same shape of scenario at
+    small scale and asserts a 50-rating burst day contributes the SAME
+    fatigue weight as a 1-rating day would -- i.e. day-bucketing, not raw
+    event count, is what the feature actually measures."""
+    db_path = tmp_path / "burst_events.duckdb"
+    es = EventStream(db_path)
+    DAY = 86400
+    # 50 Action ratings, all on day 0 (the burst)
+    for i, movie_id in enumerate(range(100, 150)):
+        es.append(Event(user_id=1, movie_id=movie_id, event_ts=0, rating=4.0))
+    # one genuine Action rating 5 days later
+    es.append(Event(user_id=1, movie_id=200, event_ts=5 * DAY, rating=4.0))
+    es.close()
+
+    movies_path = tmp_path / "movies_burst.csv"
+    with open(movies_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["movieId", "title", "genres"])
+        for movie_id in range(100, 150):
+            w.writerow([movie_id, f"M{movie_id}", "Action"])
+        w.writerow([200, "M200", "Action"])
+
+    es = EventStream(db_path)
+    rel = add_rolling_rating_count(es.con)
+    result = add_genre_fatigue_score(
+        rel, movies_csv_path=str(movies_path), window_days=30
+    ).pl()
+    es.close()
+
+    # every burst-day rating sees 0 prior days (they're all the first day)
+    burst_scores = result.filter(result["event_ts"] == 0)["genre_fatigue_score"].to_list()
+    assert all(s == 0.0 for s in burst_scores), (
+        f"burst-day ratings should all see 0 prior days, got {set(burst_scores)}"
+    )
+
+    # movie 200, 5 days later, should see exactly 1 prior day -- NOT 50
+    # (50 would mean the old, burst-vulnerable raw-count definition regressed back in)
+    movie_200_score = result.filter(result["movie_id"] == 200)["genre_fatigue_score"][0]
+    assert movie_200_score == 1.0, (
+        f"expected 1.0 (one prior day of Action activity), got {movie_200_score} -- "
+        f"if this is close to 50, the feature regressed to counting raw events "
+        f"instead of distinct days, and is vulnerable to import-burst inflation again"
     )
 
 

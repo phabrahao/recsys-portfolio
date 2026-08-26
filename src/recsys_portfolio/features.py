@@ -83,6 +83,16 @@ def add_genre_fatigue_score(
         taking the max (would overstate fatigue from the single most-repeated
         genre) or using only the first-listed genre (throws away signal from
         the rest). Average is the middle ground.
+      - COUNTS DISTINCT PRIOR DAYS with genre activity, not raw prior events.
+        This was NOT the first design: an earlier raw-event-count version was
+        found (via a p95/max sanity check against the real 32M-row data) to
+        be dominated by MovieLens bulk-import bursts -- some users have
+        thousands of ratings landing on a single calendar day (max observed:
+        6,456 ratings in one day for one user), which is an import artifact,
+        not genuine viewing/rating fatigue. Counting distinct days instead of
+        raw events means a 50-rating burst day and a 1-rating day both
+        contribute exactly "1 day of exposure" to the window, which is robust
+        to import volume while still capturing real recency.
       - Uses a RANGE window frame (not ROWS, unlike the other features in
         this module) because the window boundary is defined by elapsed time,
         not a fixed number of preceding rows. EXCLUDE CURRENT ROW keeps the
@@ -93,7 +103,6 @@ def add_genre_fatigue_score(
     is meant to be chained onto add_rolling_rating_count's output, or called
     directly on a bare events relation).
     """
-    window_seconds = window_days * 86400
     return rel.query(
         "rel_input",
         f"""
@@ -103,23 +112,34 @@ def add_genre_fatigue_score(
             WHERE genres != '(no genres listed)'
         ),
         exploded AS (
-            SELECT r.user_id, r.movie_id, r.event_ts, mg.genre
+            SELECT r.user_id, r.movie_id, r.event_ts, mg.genre,
+                   r.event_ts // 86400 AS day_bucket
             FROM rel_input r
             JOIN movie_genres mg USING (movie_id)
         ),
-        genre_exposure AS (
-            SELECT
-                user_id, movie_id, event_ts, genre,
-                count(*) OVER (
-                    PARTITION BY user_id, genre ORDER BY event_ts
-                    RANGE BETWEEN {window_seconds} PRECEDING AND CURRENT ROW
-                    EXCLUDE CURRENT ROW
-                ) AS genre_prior_count
+        exploded_days AS (
+            -- one row per (user, genre, calendar day) regardless of how many
+            -- ratings happened that day -- this is what neutralizes bursts
+            SELECT DISTINCT user_id, genre, day_bucket
             FROM exploded
         ),
+        day_exposure AS (
+            SELECT user_id, genre, day_bucket,
+                count(*) OVER (
+                    PARTITION BY user_id, genre ORDER BY day_bucket
+                    RANGE BETWEEN {window_days} PRECEDING AND CURRENT ROW
+                    EXCLUDE CURRENT ROW
+                ) AS genre_prior_day_count
+            FROM exploded_days
+        ),
+        exploded_with_count AS (
+            SELECT e.user_id, e.movie_id, e.event_ts, e.genre, d.genre_prior_day_count
+            FROM exploded e
+            JOIN day_exposure d USING (user_id, genre, day_bucket)
+        ),
         genre_agg AS (
-            SELECT user_id, movie_id, event_ts, avg(genre_prior_count) AS genre_fatigue_score
-            FROM genre_exposure
+            SELECT user_id, movie_id, event_ts, avg(genre_prior_day_count) AS genre_fatigue_score
+            FROM exploded_with_count
             GROUP BY user_id, movie_id, event_ts
         )
         SELECT rel_input.*, COALESCE(genre_agg.genre_fatigue_score, 0.0) AS genre_fatigue_score
